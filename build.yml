@@ -1,0 +1,522 @@
+name: APK Derle
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.2'
+      - name: Proje dosyalarini olustur
+        run: |
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.otoclick"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.otoclick"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="@string/app_name"
+                  android:icon="@android:drawable/ic_menu_compass"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".ClickService"
+                      android:exported="true"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+              </application>
+          </manifest>
+          EOF
+          mkdir -p app/src/main/java/com/otoclick
+          cat > app/src/main/java/com/otoclick/ClickService.kt <<'EOF'
+          package com.otoclick
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.content.Intent
+          import android.graphics.Bitmap
+          import android.graphics.Color
+          import android.graphics.Path
+          import android.graphics.PixelFormat
+          import android.graphics.drawable.GradientDrawable
+          import android.os.BatteryManager
+          import android.os.Build
+          import android.os.Handler
+          import android.os.Looper
+          import android.os.SystemClock
+          import android.view.Display
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.WindowManager
+          import android.view.accessibility.AccessibilityEvent
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import java.util.Calendar
+          import kotlin.math.abs
+          import kotlin.random.Random
+
+          class ClickService : AccessibilityService() {
+
+              private lateinit var wm: WindowManager
+              private val h = Handler(Looper.getMainLooper())
+              private val points = mutableListOf<TextView>()
+              private var xy = listOf<Pair<Int, Int>>()
+              private var panel: LinearLayout? = null
+              private var status: TextView? = null
+              private var playBtn: TextView? = null
+              private var running = false
+              private var pending: Runnable? = null
+              private var idx = 0
+              private var clicks = 0
+              private var t0 = 0L
+              private var baseline: Int? = null
+              private var lastShot = 0L
+              private var curPkg = ""
+              private var lockPkg = ""
+              private val sp get() = getSharedPreferences("s", MODE_PRIVATE)
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              // ---------- yaşam döngüsü ----------
+              override fun onServiceConnected() {
+                  if (panel != null) return
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                  buildPanel()
+                  addPoint()
+              }
+
+              override fun onAccessibilityEvent(e: AccessibilityEvent?) {
+                  if (e?.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+                      val p = e.packageName?.toString() ?: return
+                      if (p != packageName) curPkg = p
+                  }
+              }
+
+              override fun onInterrupt() {}
+
+              override fun onUnbind(intent: Intent?): Boolean {
+                  running = false
+                  pending?.let { h.removeCallbacks(it) }
+                  h.removeCallbacksAndMessages(null)
+                  points.forEach { runCatching { wm.removeView(it) } }
+                  points.clear()
+                  panel?.let { runCatching { wm.removeView(it) } }
+                  panel = null
+                  return super.onUnbind(intent)
+              }
+
+              // ---------- arayüz ----------
+              private fun lp(w: Int, hh: Int, touchable: Boolean) = WindowManager.LayoutParams(
+                  w, hh, WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                  WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                      WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                      WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                      (if (touchable) 0 else WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE),
+                  PixelFormat.TRANSLUCENT
+              ).apply { gravity = Gravity.TOP or Gravity.START }
+
+              private fun btn(t: String, onClick: () -> Unit) = TextView(this).apply {
+                  text = t; textSize = 20f; setTextColor(Color.WHITE); gravity = Gravity.CENTER
+                  layoutParams = LinearLayout.LayoutParams(dp(44), dp(44))
+                  setOnClickListener { onClick() }
+              }
+
+              private fun drag(v: View, target: View, p: WindowManager.LayoutParams) {
+                  var ox = 0f
+                  var oy = 0f
+                  v.setOnTouchListener { _, e ->
+                      when (e.actionMasked) {
+                          MotionEvent.ACTION_DOWN -> { ox = e.rawX - p.x; oy = e.rawY - p.y }
+                          MotionEvent.ACTION_MOVE -> {
+                              p.x = (e.rawX - ox).toInt(); p.y = (e.rawY - oy).toInt()
+                              wm.updateViewLayout(target, p)
+                          }
+                      }
+                      true
+                  }
+              }
+
+              private fun buildPanel() {
+                  val p = lp(WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT, true)
+                  p.x = dp(8); p.y = dp(120)
+                  val box = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      background = GradientDrawable().apply { setColor(0xEE1B1F2A.toInt()); cornerRadius = dp(16).toFloat() }
+                      setPadding(dp(8), dp(6), dp(8), dp(6))
+                  }
+                  val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  val handle = btn("⠿") {}
+                  drag(handle, box, p)
+                  playBtn = btn("▶") { toggle() }
+                  row.addView(handle)
+                  row.addView(playBtn)
+                  row.addView(btn("＋") { addPoint() })
+                  row.addView(btn("－") { removePoint() })
+                  row.addView(btn("⚙") {
+                      startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                  })
+                  status = TextView(this).apply {
+                      setTextColor(Color.WHITE); textSize = 11f; text = "Hazır"; gravity = Gravity.CENTER
+                  }
+                  box.addView(row); box.addView(status)
+                  panel = box
+                  wm.addView(box, p)
+              }
+
+              private fun addPoint() {
+                  if (running) return
+                  val size = dp(52)
+                  val p = lp(size, size, true)
+                  p.x = dp(100) + points.size * dp(30); p.y = dp(300) + points.size * dp(30)
+                  val tv = TextView(this).apply {
+                      text = "${points.size + 1}"; textSize = 18f; setTextColor(Color.WHITE); gravity = Gravity.CENTER
+                      background = GradientDrawable().apply {
+                          shape = GradientDrawable.OVAL; setColor(0x66FF3B30); setStroke(dp(3), 0xFFFF3B30.toInt())
+                      }
+                      tag = p
+                  }
+                  drag(tv, tv, p)
+                  wm.addView(tv, p)
+                  points.add(tv)
+              }
+
+              private fun removePoint() {
+                  if (running || points.isEmpty()) return
+                  wm.removeView(points.removeAt(points.lastIndex))
+              }
+
+              private fun setRunUi(on: Boolean) {
+                  val hide = on && sp.getBoolean("colorStop", false)
+                  for (v in points) {
+                      val p = v.tag as WindowManager.LayoutParams
+                      p.flags = if (on) p.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                      else p.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+                      wm.updateViewLayout(v, p)
+                      v.visibility = if (hide) View.INVISIBLE else View.VISIBLE
+                  }
+                  playBtn?.text = if (on) "■" else "▶"
+              }
+
+              private fun say(t: String) { status?.text = t }
+
+              // ---------- başlat / durdur ----------
+              private fun toggle() {
+                  if (running || pending != null) stop("Durduruldu") else begin()
+              }
+
+              private fun delayUntil(s: String): Long {
+                  val t = s.split(":").mapNotNull { it.trim().toIntOrNull() }
+                  if (t.size < 2) return 0
+                  val c = Calendar.getInstance().apply {
+                      set(Calendar.HOUR_OF_DAY, t[0]); set(Calendar.MINUTE, t[1])
+                      set(Calendar.SECOND, t.getOrElse(2) { 0 }); set(Calendar.MILLISECOND, 0)
+                  }
+                  if (c.timeInMillis <= System.currentTimeMillis()) c.add(Calendar.DAY_OF_YEAR, 1)
+                  return c.timeInMillis - System.currentTimeMillis()
+              }
+
+              private fun begin() {
+                  if (points.isEmpty()) { say("Önce ＋ ile nokta ekle"); return }
+                  val d = delayUntil(sp.getString("startAt", "") ?: "")
+                  if (d <= 0) { go(); return }
+                  val end = System.currentTimeMillis() + d
+                  playBtn?.text = "■"
+                  val tick = object : Runnable {
+                      override fun run() {
+                          val left = end - System.currentTimeMillis()
+                          if (left <= 0) { pending = null; go() }
+                          else {
+                              say("Başlıyor: ${left / 1000}s")
+                              h.postDelayed(this, minOf(left, 250L))
+                          }
+                      }
+                  }
+                  pending = tick
+                  h.post(tick)
+              }
+
+              private fun go() {
+                  xy = points.map {
+                      val loc = IntArray(2)
+                      it.getLocationOnScreen(loc)
+                      Pair(loc[0] + it.width / 2, loc[1] + it.height / 2)
+                  }
+                  running = true; idx = 0; clicks = 0; baseline = null; lastShot = 0
+                  t0 = SystemClock.elapsedRealtime()
+                  lockPkg = curPkg
+                  setRunUi(true)
+                  step()
+              }
+
+              private fun stop(msg: String) {
+                  running = false
+                  pending?.let { h.removeCallbacks(it) }
+                  pending = null
+                  h.removeCallbacksAndMessages(null)
+                  setRunUi(false)
+                  say(msg)
+              }
+
+              // ---------- döngü ----------
+              private fun battery() =
+                  (getSystemService(BATTERY_SERVICE) as BatteryManager).getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+
+              private fun nextDelay(): Long {
+                  val base = sp.getInt("interval", 100).coerceAtLeast(10)
+                  val pct = if (sp.getBoolean("human", false)) 30 else 0
+                  val f = if (pct > 0) 1 + Random.nextInt(-pct, pct + 1) / 100.0 else 1.0
+                  return (base * f).toLong().coerceAtLeast(10)
+              }
+
+              private fun step() {
+                  if (!running) return
+                  val rounds = sp.getInt("count", 0)
+                  val maxSec = sp.getInt("maxSec", 0)
+                  val minBat = sp.getInt("minBat", 15)
+                  if (rounds > 0 && clicks >= rounds * xy.size) return stop("Bitti ✓ $clicks tık")
+                  if (maxSec > 0 && SystemClock.elapsedRealtime() - t0 > maxSec * 1000L) return stop("Süre doldu • $clicks tık")
+                  if (minBat > 0 && battery() in 1 until minBat) return stop("Pil düşük, durdu")
+                  if (sp.getBoolean("appLock", true) && lockPkg.isNotEmpty() && curPkg != lockPkg)
+                      return stop("Uygulamadan çıkıldı, durdu")
+
+                  val now = SystemClock.elapsedRealtime()
+                  if (sp.getBoolean("colorStop", false) && Build.VERSION.SDK_INT >= 30 && now - lastShot > 700) {
+                      lastShot = now
+                      watchColor { changed ->
+                          if (!running) return@watchColor
+                          if (changed) stop("Ekran değişti, durdu ✓") else click()
+                      }
+                  } else click()
+              }
+
+              private fun click() {
+                  val human = sp.getBoolean("human", false)
+                  val (cx, cy) = xy[idx % xy.size]
+                  val j = if (human) dp(4) else 0
+                  val x = cx + if (j > 0) Random.nextInt(-j, j + 1) else 0
+                  val y = cy + if (j > 0) Random.nextInt(-j, j + 1) else 0
+                  val path = Path().apply { moveTo(x.toFloat(), y.toFloat()) }
+                  val dur = 20L + if (human) Random.nextLong(0, 30) else 0L
+                  val g = GestureDescription.Builder()
+                      .addStroke(GestureDescription.StrokeDescription(path, 0, dur)).build()
+                  val next = {
+                      clicks++; idx++
+                      say("#$clicks • nokta ${(idx - 1) % xy.size + 1}")
+                      h.postDelayed({ step() }, nextDelay())
+                  }
+                  val ok = dispatchGesture(g, object : GestureResultCallback() {
+                      override fun onCompleted(d: GestureDescription?) { next() }
+                      override fun onCancelled(d: GestureDescription?) { next() }
+                  }, null)
+                  if (!ok) stop("Hata: tıklama gönderilemedi")
+              }
+
+              private fun dist(a: Int, b: Int) =
+                  abs(Color.red(a) - Color.red(b)) + abs(Color.green(a) - Color.green(b)) + abs(Color.blue(a) - Color.blue(b))
+
+              @android.annotation.TargetApi(30)
+              private fun watchColor(cb: (Boolean) -> Unit) {
+                  takeScreenshot(Display.DEFAULT_DISPLAY, mainExecutor, object : TakeScreenshotCallback {
+                      override fun onSuccess(r: ScreenshotResult) {
+                          val hb = r.hardwareBuffer
+                          val soft = Bitmap.wrapHardwareBuffer(hb, r.colorSpace)?.copy(Bitmap.Config.ARGB_8888, false)
+                          hb.close()
+                          if (soft == null) { cb(false); return }
+                          val (px, py) = xy[0]
+                          val c = soft.getPixel(px.coerceIn(0, soft.width - 1), py.coerceIn(0, soft.height - 1))
+                          soft.recycle()
+                          val b = baseline
+                          if (b == null) { baseline = c; cb(false) } else cb(dist(b, c) > 90)
+                      }
+                      override fun onFailure(errorCode: Int) { cb(false) }
+                  })
+              }
+          }
+          EOF
+          mkdir -p app/src/main/java/com/otoclick
+          cat > app/src/main/java/com/otoclick/MainActivity.kt <<'EOF'
+          package com.otoclick
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.text.InputType
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.Switch
+          import android.widget.TextView
+
+          class MainActivity : Activity() {
+
+              private val numDefaults = linkedMapOf("interval" to 100, "count" to 0, "maxSec" to 0, "minBat" to 15)
+              private val numLabels = mapOf(
+                  "interval" to "Tıklama aralığı (ms)",
+                  "count" to "Tur sayısı (0 = sınırsız)",
+                  "maxSec" to "En çok süre, saniye (0 = sınırsız)",
+                  "minBat" to "Pil bu %'nin altına düşünce dur (0 = kapalı)"
+              )
+              private val boxes = mutableMapOf<String, EditText>()
+              private val switches = linkedMapOf<String, Switch>()
+              private lateinit var startAt: EditText
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  val sp = getSharedPreferences("s", MODE_PRIVATE)
+                  val d = resources.displayMetrics.density
+                  fun px(v: Int) = (v * d).toInt()
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(px(20), px(48), px(20), px(32))
+                  }
+                  root.addView(TextView(this).apply { text = "OtoClick"; textSize = 28f })
+                  root.addView(TextView(this).apply {
+                      text = "1) Aşağıdan erişilebilirliği aç\n2) Kayan paneldeki ＋ ile nokta ekle, hedefe sürükle\n3) ▶ ile başlat"
+                      setPadding(0, px(8), 0, px(16))
+                  })
+                  root.addView(Button(this).apply {
+                      text = "Erişilebilirlik ayarlarını aç"
+                      setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                  })
+
+                  for ((k, def) in numDefaults) {
+                      root.addView(TextView(this).apply { text = numLabels[k]; setPadding(0, px(14), 0, 0) })
+                      val e = EditText(this).apply {
+                          inputType = InputType.TYPE_CLASS_NUMBER
+                          setText(sp.getInt(k, def).toString())
+                      }
+                      boxes[k] = e; root.addView(e)
+                  }
+
+                  root.addView(TextView(this).apply {
+                      text = "Zamanlı başlat (SS:DD:SS, boş = hemen)"; setPadding(0, px(14), 0, 0)
+                  })
+                  startAt = EditText(this).apply {
+                      hint = "20:00:00"
+                      setText(sp.getString("startAt", ""))
+                  }
+                  root.addView(startAt)
+
+                  val sw = listOf(
+                      Triple("human", "İnsan modu (rastgele konum + süre)", false),
+                      Triple("colorStop", "Renk tetikleyici: 1. noktadaki renk değişince dur", false),
+                      Triple("appLock", "Uygulama kilidi: başladığın uygulamadan çıkınca dur", true)
+                  )
+                  for ((k, label, def) in sw) {
+                      val s = Switch(this).apply {
+                          text = label; isChecked = sp.getBoolean(k, def); setPadding(0, px(14), 0, 0)
+                      }
+                      switches[k] = s; root.addView(s)
+                  }
+                  setContentView(ScrollView(this).apply { addView(root) })
+              }
+
+              override fun onPause() {
+                  super.onPause()
+                  val ed = getSharedPreferences("s", MODE_PRIVATE).edit()
+                  for ((k, def) in numDefaults) ed.putInt(k, boxes[k]?.text?.toString()?.toIntOrNull() ?: def)
+                  ed.putString("startAt", startAt.text.toString().trim())
+                  for ((k, s) in switches) ed.putBoolean(k, s.isChecked)
+                  ed.apply()
+              }
+          }
+          EOF
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'EOF'
+          <resources>
+              <string name="app_name">OtoClick</string>
+              <string name="svc_desc">Ekranda belirlediğin noktalara otomatik dokunur.</string>
+          </resources>
+          EOF
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/accessibility_config.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:canPerformGestures="true"
+              android:canTakeScreenshot="true"
+              android:description="@string/svc_desc"
+              android:notificationTimeout="100" />
+          EOF
+          mkdir -p .
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.2.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.22" apply false
+          }
+          EOF
+          mkdir -p .
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=false
+          kotlin.code.style=official
+          EOF
+          mkdir -p .
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "OtoClick"
+          include(":app")
+          EOF
+      - name: APK derle
+        run: gradle assembleDebug --no-daemon
+      - name: Release olarak yayinla
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk OtoClick.apk
+          gh release create "v${{ github.run_number }}" OtoClick.apk --repo "${{ github.repository }}" --target "${{ github.sha }}" --title "OtoClick v${{ github.run_number }}" --notes "APK hazir"
